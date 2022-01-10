@@ -1,0 +1,583 @@
+import {
+  createBackendContext,
+  BackendContext,
+  Plugin,
+  BuiltinBackendFeature,
+  AppRecord,
+} from '@vue-devtools/app-backend-api'
+import {
+  Bridge,
+  HookEvents,
+  BridgeEvents,
+  BuiltinTabs,
+  initSharedData,
+  BridgeSubscriptions,
+  parse,
+  revive,
+  target,
+  getPluginSettings,
+  SharedData,
+} from '@vue-devtools/shared-utils'
+import debounce from 'lodash/debounce'
+import { hook } from './global-hook'
+import { subscribe, unsubscribe, isSubscribed } from './util/subscriptions'
+import { highlight, unHighlight } from './highlighter'
+import { setupTimeline, sendTimelineLayers, addTimelineEvent, clearTimeline, sendTimelineEventData, sendTimelineLayerEvents } from './timeline'
+import ComponentPicker from './component-pick'
+import {
+  sendComponentTreeData,
+  sendSelectedComponentData,
+  sendEmptyComponentData,
+  getComponentId,
+  editComponentState,
+  getComponentInstance,
+} from './component'
+import { addQueuedPlugins, addPlugin, sendPluginList, addPreviouslyRegisteredPlugins } from './plugin'
+import { PluginDescriptor, SetupFunction, TimelineLayerOptions, TimelineEventOptions, CustomInspectorOptions, Hooks } from '@vue/devtools-api'
+import { registerApp, selectApp, waitForAppsRegistration, sendApps, _legacy_getAndRegisterApps, getAppRecord, removeApp } from './app'
+import { sendInspectorTree, getInspector, getInspectorWithAppId, sendInspectorState, editInspectorState, sendCustomInspectors, selectInspectorNode } from './inspector'
+import { showScreenshot } from './timeline-screenshot'
+import { performanceMarkEnd, performanceMarkStart } from './perf'
+import { initOnPageConfig } from './page-config'
+import { sendTimelineMarkers, addTimelineMarker } from './timeline-marker'
+
+let ctx: BackendContext = target.__vdevtools_ctx ?? null
+let connected = target.__vdevtools_connected ?? false
+
+export async function initBackend (bridge: Bridge) {
+  await initSharedData({
+    bridge,
+    persist: false,
+  })
+
+  initOnPageConfig()
+
+  if (!connected) {
+    // connected = false
+    ctx = target.__vdevtools_ctx = createBackendContext({
+      bridge,
+      hook,
+    })
+
+    if (hook.Vue) {
+      connect()
+      _legacy_getAndRegisterApps(hook.Vue, ctx)
+    } else {
+      hook.once(HookEvents.INIT, (Vue) => {
+        _legacy_getAndRegisterApps(Vue, ctx)
+      })
+    }
+
+    hook.on(HookEvents.APP_ADD, async app => {
+      await registerApp(app, ctx)
+
+      // Will init connect
+      hook.emit(HookEvents.INIT)
+    })
+
+    // Add apps that already sent init
+    if (hook.apps.length) {
+      hook.apps.forEach(app => {
+        registerApp(app, ctx)
+        connect()
+      })
+    }
+  } else {
+    ctx.bridge = bridge
+    connectBridge()
+  }
+}
+
+async function connect () {
+  if (connected) {
+    return
+  }
+  connected = target.__vdevtools_connected = true
+
+  await waitForAppsRegistration()
+
+  connectBridge()
+
+  ctx.currentTab = BuiltinTabs.COMPONENTS
+
+  // Apps
+
+  hook.on(HookEvents.APP_UNMOUNT, app => {
+    removeApp(app, ctx)
+  })
+
+  // Components
+
+  hook.on(HookEvents.COMPONENT_UPDATED, async (app, uid, parentUid, component) => {
+    try {
+      let id: string
+      let appRecord: AppRecord
+      if (app && uid != null) {
+        id = await getComponentId(app, uid, component, ctx)
+        appRecord = await getAppRecord(app, ctx)
+      } else {
+        id = ctx.currentInspectedComponentId
+        appRecord = ctx.currentAppRecord
+      }
+
+      // Update component inspector
+      if (id && isSubscribed(BridgeSubscriptions.SELECTED_COMPONENT_DATA, sub => sub.payload.instanceId === id)) {
+        sendSelectedComponentData(appRecord, id, ctx)
+      }
+
+      // Update tree (tags)
+      if (isSubscribed(BridgeSubscriptions.COMPONENT_TREE, sub => sub.payload.instanceId === id)) {
+        sendComponentTreeData(appRecord, id, appRecord.componentFilter, 0, ctx)
+      }
+    } catch (e) {
+      if (SharedData.debugInfo) {
+        console.error(e)
+      }
+    }
+  })
+
+  hook.on(HookEvents.COMPONENT_ADDED, async (app, uid, parentUid, component) => {
+    try {
+      const id = await getComponentId(app, uid, component, ctx)
+      const appRecord = await getAppRecord(app, ctx)
+      if (component) {
+        if (component.__VUE_DEVTOOLS_UID__ == null) {
+          component.__VUE_DEVTOOLS_UID__ = id
+        }
+        if (!appRecord.instanceMap.has(id)) {
+          appRecord.instanceMap.set(id, component)
+        }
+      }
+
+      if (parentUid != null) {
+        const parentInstances = await appRecord.backend.api.walkComponentParents(component)
+        if (parentInstances.length) {
+          // Check two parents level to update `hasChildren
+          for (let i = 0; i < 2 && i < parentInstances.length; i++) {
+            const parentId = await getComponentId(app, parentUid, parentInstances[i], ctx)
+            if (isSubscribed(BridgeSubscriptions.COMPONENT_TREE, sub => sub.payload.instanceId === parentId)) {
+              requestAnimationFrame(() => {
+                sendComponentTreeData(appRecord, parentId, appRecord.componentFilter, null, ctx)
+              })
+            }
+          }
+        }
+      }
+
+      if (ctx.currentInspectedComponentId === id) {
+        sendSelectedComponentData(appRecord, id, ctx)
+      }
+    } catch (e) {
+      if (SharedData.debugInfo) {
+        console.error(e)
+      }
+    }
+  })
+
+  hook.on(HookEvents.COMPONENT_REMOVED, async (app, uid, parentUid, component) => {
+    try {
+      const appRecord = await getAppRecord(app, ctx)
+      if (parentUid != null) {
+        const parentInstances = await appRecord.backend.api.walkComponentParents(component)
+        if (parentInstances.length) {
+          const parentId = await getComponentId(app, parentUid, parentInstances[0], ctx)
+          if (isSubscribed(BridgeSubscriptions.COMPONENT_TREE, sub => sub.payload.instanceId === parentId)) {
+            requestAnimationFrame(async () => {
+              try {
+                sendComponentTreeData(await getAppRecord(app, ctx), parentId, appRecord.componentFilter, null, ctx)
+              } catch (e) {
+                if (SharedData.debugInfo) {
+                  console.error(e)
+                }
+              }
+            })
+          }
+        }
+      }
+
+      const id = await getComponentId(app, uid, component, ctx)
+      if (isSubscribed(BridgeSubscriptions.SELECTED_COMPONENT_DATA, sub => sub.payload.instanceId === id)) {
+        sendEmptyComponentData(id, ctx)
+      }
+      appRecord.instanceMap.delete(id)
+    } catch (e) {
+      if (SharedData.debugInfo) {
+        console.error(e)
+      }
+    }
+  })
+
+  // Component perf
+
+  hook.on(HookEvents.PERFORMANCE_START, (app, uid, vm, type, time) => {
+    performanceMarkStart(app, uid, vm, type, time, ctx)
+  })
+
+  hook.on(HookEvents.PERFORMANCE_END, (app, uid, vm, type, time) => {
+    performanceMarkEnd(app, uid, vm, type, time, ctx)
+  })
+
+  // Highlighter
+
+  hook.on(HookEvents.COMPONENT_HIGHLIGHT, instanceId => {
+    highlight(ctx.currentAppRecord.instanceMap.get(instanceId), ctx.currentAppRecord.backend, ctx)
+  })
+
+  hook.on(HookEvents.COMPONENT_UNHIGHLIGHT, () => {
+    unHighlight()
+  })
+
+  // Timeline
+
+  setupTimeline(ctx)
+
+  hook.on(HookEvents.TIMELINE_LAYER_ADDED, async (options: TimelineLayerOptions, plugin: Plugin) => {
+    const appRecord = await getAppRecord(plugin.descriptor.app, ctx)
+    ctx.timelineLayers.push({
+      ...options,
+      appRecord,
+      plugin,
+      events: [],
+    })
+    ctx.bridge.send(BridgeEvents.TO_FRONT_TIMELINE_LAYER_ADD, {})
+  })
+
+  hook.on(HookEvents.TIMELINE_EVENT_ADDED, async (options: TimelineEventOptions, plugin: Plugin) => {
+    await addTimelineEvent(options, plugin.descriptor.app, ctx)
+  })
+
+  // Custom inspectors
+
+  hook.on(HookEvents.CUSTOM_INSPECTOR_ADD, async (options: CustomInspectorOptions, plugin: Plugin) => {
+    const appRecord = await getAppRecord(plugin.descriptor.app, ctx)
+    ctx.customInspectors.push({
+      ...options,
+      appRecord,
+      plugin,
+      treeFilter: '',
+      selectedNodeId: null,
+    })
+    ctx.bridge.send(BridgeEvents.TO_FRONT_CUSTOM_INSPECTOR_ADD, {})
+  })
+
+  hook.on(HookEvents.CUSTOM_INSPECTOR_SEND_TREE, (inspectorId: string, plugin: Plugin) => {
+    const inspector = getInspector(inspectorId, plugin.descriptor.app, ctx)
+    if (inspector) {
+      sendInspectorTree(inspector, ctx)
+    } else if (SharedData.debugInfo) {
+      console.warn(`Inspector ${inspectorId} not found`)
+    }
+  })
+
+  hook.on(HookEvents.CUSTOM_INSPECTOR_SEND_STATE, (inspectorId: string, plugin: Plugin) => {
+    const inspector = getInspector(inspectorId, plugin.descriptor.app, ctx)
+    if (inspector) {
+      sendInspectorState(inspector, ctx)
+    } else if (SharedData.debugInfo) {
+      console.warn(`Inspector ${inspectorId} not found`)
+    }
+  })
+
+  hook.on(HookEvents.CUSTOM_INSPECTOR_SELECT_NODE, async (inspectorId: string, nodeId: string, plugin: Plugin) => {
+    const inspector = getInspector(inspectorId, plugin.descriptor.app, ctx)
+    if (inspector) {
+      await selectInspectorNode(inspector, nodeId, ctx)
+    } else if (SharedData.debugInfo) {
+      console.warn(`Inspector ${inspectorId} not found`)
+    }
+  })
+
+  // Plugins
+
+  addPreviouslyRegisteredPlugins(ctx)
+  addQueuedPlugins(ctx)
+
+  hook.on(HookEvents.SETUP_DEVTOOLS_PLUGIN, async (pluginDescriptor: PluginDescriptor, setupFn: SetupFunction) => {
+    await addPlugin({ pluginDescriptor, setupFn }, ctx)
+  })
+
+  target.__VUE_DEVTOOLS_PLUGIN_API_AVAILABLE__ = true
+
+  // Legacy flush
+
+  const handleFlush = debounce(() => {
+    if (ctx.currentAppRecord?.backend.options.features.includes(BuiltinBackendFeature.FLUSH)) {
+      sendComponentTreeData(ctx.currentAppRecord, '_root', ctx.currentAppRecord.componentFilter, null, ctx)
+      if (ctx.currentInspectedComponentId) {
+        sendSelectedComponentData(ctx.currentAppRecord, ctx.currentInspectedComponentId, ctx)
+      }
+    }
+  }, 500)
+
+  hook.off(HookEvents.FLUSH)
+  hook.on(HookEvents.FLUSH, handleFlush)
+
+  // Connect done
+
+  addTimelineMarker({
+    id: 'vue-devtools-init-backend',
+    time: Date.now(),
+    label: 'Vue Devtools connected',
+    color: 0x41B883,
+    all: true,
+  }, ctx)
+}
+
+function connectBridge () {
+  // Subscriptions
+
+  ctx.bridge.on(BridgeEvents.TO_BACK_SUBSCRIBE, ({ type, payload }) => {
+    subscribe(type, payload)
+  })
+
+  ctx.bridge.on(BridgeEvents.TO_BACK_UNSUBSCRIBE, ({ type, payload }) => {
+    unsubscribe(type, payload)
+  })
+
+  // Tabs
+
+  ctx.bridge.on(BridgeEvents.TO_BACK_TAB_SWITCH, async tab => {
+    ctx.currentTab = tab
+    await unHighlight()
+  })
+
+  // Apps
+
+  ctx.bridge.on(BridgeEvents.TO_BACK_APP_LIST, () => {
+    sendApps(ctx)
+  })
+
+  ctx.bridge.on(BridgeEvents.TO_BACK_APP_SELECT, async id => {
+    if (id == null) return
+    const record = ctx.appRecords.find(r => r.id === id)
+    if (record) {
+      await selectApp(record, ctx)
+    } else if (SharedData.debugInfo) {
+      console.warn(`App with id ${id} not found`)
+    }
+  })
+
+  // Components
+
+  ctx.bridge.on(BridgeEvents.TO_BACK_COMPONENT_TREE, ({ instanceId, filter }) => {
+    ctx.currentAppRecord.componentFilter = filter
+    sendComponentTreeData(ctx.currentAppRecord, instanceId, filter, null, ctx)
+    subscribe(BridgeSubscriptions.COMPONENT_TREE, { instanceId })
+  })
+
+  ctx.bridge.on(BridgeEvents.TO_BACK_COMPONENT_SELECTED_DATA, (instanceId) => {
+    sendSelectedComponentData(ctx.currentAppRecord, instanceId, ctx)
+  })
+
+  ctx.bridge.on(BridgeEvents.TO_BACK_COMPONENT_EDIT_STATE, ({ instanceId, dotPath, type, value, newKey, remove }) => {
+    editComponentState(instanceId, dotPath, type, { value, newKey, remove }, ctx)
+  })
+
+  ctx.bridge.on(BridgeEvents.TO_BACK_COMPONENT_INSPECT_DOM, async ({ instanceId }) => {
+    const instance = getComponentInstance(ctx.currentAppRecord, instanceId, ctx)
+    if (instance) {
+      const [el] = await ctx.currentAppRecord.backend.api.getComponentRootElements(instance)
+      if (el) {
+        // @ts-ignore
+        window.__VUE_DEVTOOLS_INSPECT_TARGET__ = el
+        ctx.bridge.send(BridgeEvents.TO_FRONT_COMPONENT_INSPECT_DOM, null)
+      }
+    }
+  })
+
+  ctx.bridge.on(BridgeEvents.TO_BACK_COMPONENT_SCROLL_TO, async ({ instanceId }) => {
+    const instance = getComponentInstance(ctx.currentAppRecord, instanceId, ctx)
+    if (instance) {
+      const [el] = await ctx.currentAppRecord.backend.api.getComponentRootElements(instance)
+      if (el) {
+        if (typeof el.scrollIntoView === 'function') {
+          el.scrollIntoView({
+            behavior: 'smooth',
+            block: 'center',
+            inline: 'center',
+          })
+        } else {
+          // Handle nodes that don't implement scrollIntoView
+          const bounds = await ctx.currentAppRecord.backend.api.getComponentBounds(instance)
+          const scrollTarget = document.createElement('div')
+          scrollTarget.style.position = 'absolute'
+          scrollTarget.style.width = `${bounds.width}px`
+          scrollTarget.style.height = `${bounds.height}px`
+          scrollTarget.style.top = `${bounds.top}px`
+          scrollTarget.style.left = `${bounds.left}px`
+          document.body.appendChild(scrollTarget)
+          scrollTarget.scrollIntoView({
+            behavior: 'smooth',
+            block: 'center',
+            inline: 'center',
+          })
+          setTimeout(() => {
+            document.body.removeChild(scrollTarget)
+          }, 2000)
+        }
+        highlight(instance, ctx.currentAppRecord.backend, ctx)
+        setTimeout(() => {
+          unHighlight()
+        }, 2000)
+      }
+    }
+  })
+
+  ctx.bridge.on(BridgeEvents.TO_BACK_COMPONENT_RENDER_CODE, async ({ instanceId }) => {
+    const instance = getComponentInstance(ctx.currentAppRecord, instanceId, ctx)
+    if (instance) {
+      const { code } = await ctx.currentAppRecord.backend.api.getComponentRenderCode(instance)
+      ctx.bridge.send(BridgeEvents.TO_FRONT_COMPONENT_RENDER_CODE, {
+        instanceId,
+        code,
+      })
+    }
+  })
+
+  ctx.bridge.on(BridgeEvents.TO_BACK_CUSTOM_STATE_ACTION, async ({ value, actionIndex }) => {
+    const rawAction = value._custom.actions[actionIndex]
+    const action = revive(rawAction?.action)
+    if (action) {
+      try {
+        await action()
+      } catch (e) {
+        console.error(e)
+      }
+    } else {
+      console.warn(`Couldn't revive action ${actionIndex} from`, value)
+    }
+  })
+
+  // Highlighter
+
+  ctx.bridge.on(BridgeEvents.TO_BACK_COMPONENT_MOUSE_OVER, instanceId => {
+    highlight(ctx.currentAppRecord.instanceMap.get(instanceId), ctx.currentAppRecord.backend, ctx)
+  })
+
+  ctx.bridge.on(BridgeEvents.TO_BACK_COMPONENT_MOUSE_OUT, () => {
+    unHighlight()
+  })
+
+  // Component picker
+
+  const componentPicker = new ComponentPicker(ctx)
+
+  ctx.bridge.on(BridgeEvents.TO_BACK_COMPONENT_PICK, () => {
+    componentPicker.startSelecting()
+  })
+
+  ctx.bridge.on(BridgeEvents.TO_BACK_COMPONENT_PICK_CANCELED, () => {
+    componentPicker.stopSelecting()
+  })
+
+  // Timeline
+
+  ctx.bridge.on(BridgeEvents.TO_BACK_TIMELINE_LAYER_LIST, () => {
+    sendTimelineLayers(ctx)
+  })
+
+  ctx.bridge.on(BridgeEvents.TO_BACK_TIMELINE_SHOW_SCREENSHOT, ({ screenshot }) => {
+    showScreenshot(screenshot, ctx)
+  })
+
+  ctx.bridge.on(BridgeEvents.TO_BACK_TIMELINE_CLEAR, async () => {
+    await clearTimeline(ctx)
+  })
+
+  ctx.bridge.on(BridgeEvents.TO_BACK_TIMELINE_EVENT_DATA, async ({ id }) => {
+    await sendTimelineEventData(id, ctx)
+  })
+
+  ctx.bridge.on(BridgeEvents.TO_BACK_TIMELINE_LAYER_LOAD_EVENTS, ({ appId, layerId }) => {
+    sendTimelineLayerEvents(appId, layerId, ctx)
+  })
+
+  ctx.bridge.on(BridgeEvents.TO_BACK_TIMELINE_LOAD_MARKERS, async () => {
+    await sendTimelineMarkers(ctx)
+  })
+
+  // Custom inspectors
+
+  ctx.bridge.on(BridgeEvents.TO_BACK_CUSTOM_INSPECTOR_LIST, () => {
+    sendCustomInspectors(ctx)
+  })
+
+  ctx.bridge.on(BridgeEvents.TO_BACK_CUSTOM_INSPECTOR_TREE, async ({ inspectorId, appId, treeFilter }) => {
+    const inspector = await getInspectorWithAppId(inspectorId, appId, ctx)
+    if (inspector) {
+      inspector.treeFilter = treeFilter
+      sendInspectorTree(inspector, ctx)
+    } else if (SharedData.debugInfo) {
+      console.warn(`Inspector ${inspectorId} not found`)
+    }
+  })
+
+  ctx.bridge.on(BridgeEvents.TO_BACK_CUSTOM_INSPECTOR_STATE, async ({ inspectorId, appId, nodeId }) => {
+    const inspector = await getInspectorWithAppId(inspectorId, appId, ctx)
+    if (inspector) {
+      inspector.selectedNodeId = nodeId
+      sendInspectorState(inspector, ctx)
+    } else if (SharedData.debugInfo) {
+      console.warn(`Inspector ${inspectorId} not found`)
+    }
+  })
+
+  ctx.bridge.on(BridgeEvents.TO_BACK_CUSTOM_INSPECTOR_EDIT_STATE, async ({ inspectorId, appId, nodeId, path, type, payload }) => {
+    const inspector = await getInspectorWithAppId(inspectorId, appId, ctx)
+    if (inspector) {
+      await editInspectorState(inspector, nodeId, path, type, payload, ctx)
+      inspector.selectedNodeId = nodeId
+      await sendInspectorState(inspector, ctx)
+    } else if (SharedData.debugInfo) {
+      console.warn(`Inspector ${inspectorId} not found`)
+    }
+  })
+
+  ctx.bridge.on(BridgeEvents.TO_BACK_CUSTOM_INSPECTOR_ACTION, async ({ inspectorId, appId, actionIndex }) => {
+    const inspector = await getInspectorWithAppId(inspectorId, appId, ctx)
+    if (inspector) {
+      const action = inspector.actions[actionIndex]
+      try {
+        await action.action()
+      } catch (e) {
+        if (SharedData.debugInfo) {
+          console.error(e)
+        }
+      }
+    } else if (SharedData.debugInfo) {
+      console.warn(`Inspector ${inspectorId} not found`)
+    }
+  })
+
+  // Misc
+
+  ctx.bridge.on(BridgeEvents.TO_BACK_LOG, (payload: { level: string, value: any, serialized?: boolean, revive?: boolean }) => {
+    let value = payload.value
+    if (payload.serialized) {
+      value = parse(value, payload.revive)
+    } else if (payload.revive) {
+      value = revive(value)
+    }
+    // eslint-disable-next-line no-console
+    console[payload.level](value)
+  })
+
+  // Plugins
+
+  ctx.bridge.on(BridgeEvents.TO_BACK_DEVTOOLS_PLUGIN_LIST, async () => {
+    await sendPluginList(ctx)
+  })
+
+  ctx.bridge.on(BridgeEvents.TO_BACK_DEVTOOLS_PLUGIN_SETTING_UPDATED, ({ pluginId, key, newValue, oldValue }) => {
+    const settings = getPluginSettings(pluginId)
+    ctx.hook.emit(HookEvents.PLUGIN_SETTINGS_SET, pluginId, settings)
+    ctx.currentAppRecord.backend.api.callHook(Hooks.SET_PLUGIN_SETTINGS, {
+      app: ctx.currentAppRecord.options.app,
+      pluginId,
+      key,
+      newValue,
+      oldValue,
+      settings,
+    })
+  })
+}
